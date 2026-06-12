@@ -266,6 +266,22 @@ def _convert_messages_for_vision(
     return new_messages
 
 
+def _append_system_context(system_message: LLMMessage, content) -> None:
+    """Fold extra system prompts into the leading system message."""
+    if content is None:
+        return
+    if isinstance(content, str):
+        text = content.strip()
+    else:
+        text = json.dumps(content, ensure_ascii=False)
+    if not text:
+        return
+    if system_message.dynamic_content:
+        system_message.dynamic_content = f"{system_message.dynamic_content}\n\n{text}"
+    else:
+        system_message.dynamic_content = text
+
+
 def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
     """Check if tool requires arguments and return (should_execute, result_or_error)."""
     if not args and tool_name in TOOLS_REQUIRING_ARGS:
@@ -470,9 +486,14 @@ async def call_llm(
         tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
-    # Convert messages to LLMMessage format
-    api_messages = [LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt)]
+    # Convert messages to LLMMessage format. Keep exactly one leading system
+    # message so stricter OpenAI-compatible gateways (vLLM/LiteLLM) accept it.
+    system_message = LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt)
+    api_messages = [system_message]
     for msg in messages:
+        if msg.get("role", "user") == "system":
+            _append_system_context(system_message, msg.get("content"))
+            continue
         api_messages.append(LLMMessage(
             role=msg.get("role", "user"),
             content=msg.get("content"),
