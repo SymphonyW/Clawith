@@ -515,8 +515,15 @@ async def create_agent(
                     f"on agent {agent.id} raised: {e}"
                 )
 
-    # Start container first (non-blocking if Docker available)
-    await agent_manager.start_container(db, agent)
+    # Native agents run on the backend runtime and do not need a per-agent
+    # OpenClaw Docker container. The container manager is only for legacy local
+    # gateway workers; requiring its image would mark otherwise healthy agents
+    # as errored in source deployments.
+    if agent.agent_type == "native":
+        agent.status = "idle"
+        agent.last_active_at = datetime.now(tz.utc)
+    else:
+        await agent_manager.start_container(db, agent)
     await db.flush()
 
     # Commit agent and basic setup before async operations
@@ -1082,7 +1089,11 @@ async def start_agent(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can start agent")
 
     from app.services.agent_manager import agent_manager
-    await agent_manager.start_container(db, agent)
+    if agent.agent_type == "native":
+        agent.status = "idle"
+        agent.last_active_at = datetime.now(timezone.utc)
+    else:
+        await agent_manager.start_container(db, agent)
     await db.flush()
     return await _agent_to_out(db, agent, current_user.id)
 
@@ -1099,7 +1110,12 @@ async def stop_agent(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can stop agent")
 
     from app.services.agent_manager import agent_manager
-    await agent_manager.stop_container(agent)
+    if agent.agent_type == "native":
+        agent.status = "stopped"
+        agent.container_id = None
+        agent.container_port = None
+    else:
+        await agent_manager.stop_container(agent)
     await db.flush()
     return await _agent_to_out(db, agent, current_user.id)
 
