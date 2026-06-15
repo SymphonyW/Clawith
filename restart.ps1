@@ -55,6 +55,84 @@ function Get-CommandPath {
     return $command.Path
 }
 
+function Get-ChildProcessIds {
+    param([int]$ProcessId)
+
+    try {
+        Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" |
+            Select-Object -ExpandProperty ProcessId
+    }
+    catch {
+        @()
+    }
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    foreach ($childId in Get-ChildProcessIds $ProcessId) {
+        Stop-ProcessTree ([int]$childId)
+    }
+
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($process) {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ProcessBelongsToProject {
+    param([int]$ProcessId)
+
+    $visited = @{}
+    $currentId = $ProcessId
+    while ($currentId -and -not $visited.ContainsKey($currentId)) {
+        $visited[$currentId] = $true
+
+        try {
+            $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $currentId" -ErrorAction SilentlyContinue
+        }
+        catch {
+            $processInfo = $null
+        }
+
+        if (-not $processInfo) {
+            return $false
+        }
+
+        if ($processInfo.CommandLine -and $processInfo.CommandLine.IndexOf($Root, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+        if ($processInfo.ExecutablePath -and $processInfo.ExecutablePath.IndexOf($Root, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+
+        $currentId = [int]$processInfo.ParentProcessId
+    }
+
+    return $false
+}
+
+function Stop-ProjectPortOwner {
+    param(
+        [int]$Port,
+        [string]$Name
+    )
+
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($listener in @($listeners)) {
+        $pidValue = [int]$listener.OwningProcess
+        if (Test-ProcessBelongsToProject $pidValue) {
+            Stop-ProcessTree $pidValue
+            Write-Ok "Stopped stale $Name listener on port $Port (PID $pidValue)"
+            continue
+        }
+
+        $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+        $processName = if ($process) { $process.ProcessName } else { "unknown" }
+        Write-Warn "Port $Port is still owned by PID $pidValue ($processName); leaving it alone because it does not look like this Clawith checkout"
+    }
+}
+
 function Invoke-External {
     param(
         [string]$FilePath,
@@ -261,7 +339,7 @@ function Stop-ManagedProcess {
 
     $process = Get-Process -Id ([int]$rawPid) -ErrorAction SilentlyContinue
     if ($process) {
-        Stop-Process -Id $process.Id -Force
+        Stop-ProcessTree $process.Id
         Write-Ok "Stopped $Name (PID $rawPid)"
     }
 }
@@ -287,6 +365,42 @@ function Find-FreePort {
     return $port
 }
 
+function Test-HttpOk {
+    param(
+        [string]$Url,
+        [int]$TimeoutSeconds = 2
+    )
+
+    $handler = $null
+    $client = $null
+    $response = $null
+    $probeUrl = $Url -replace '://localhost(?=[:/])', '://127.0.0.1'
+
+    try {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.UseProxy = $false
+        $client = New-Object System.Net.Http.HttpClient -ArgumentList $handler
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $response = $client.GetAsync($probeUrl).GetAwaiter().GetResult()
+        return $response.IsSuccessStatusCode
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($response) {
+            $response.Dispose()
+        }
+        if ($client) {
+            $client.Dispose()
+        }
+        if ($handler) {
+            $handler.Dispose()
+        }
+    }
+}
+
 function Wait-ForHttp {
     param(
         [string]$Name,
@@ -295,14 +409,11 @@ function Wait-ForHttp {
     )
 
     for ($i = 1; $i -le $TimeoutSeconds; $i++) {
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 > $null
+        if (Test-HttpOk $Url 2) {
             Write-Ok "$Name ready"
             return $true
         }
-        catch {
-            Start-Sleep -Seconds 1
-        }
+        Start-Sleep -Seconds 1
     }
 
     Write-Warn "$Name did not answer at $Url within ${TimeoutSeconds}s"
@@ -350,6 +461,10 @@ $env:PROCESS_ROLE = if ($env:PROCESS_ROLE) { $env:PROCESS_ROLE } else { "all" }
 Write-Step "Stopping existing PowerShell-managed services"
 Stop-ManagedProcess "backend" $BackendPid
 Stop-ManagedProcess "frontend" $FrontendPid
+for ($offset = 0; $offset -le 2; $offset++) {
+    Stop-ProjectPortOwner ($BackendPort + $offset) "backend"
+    Stop-ProjectPortOwner ($FrontendPort + $offset) "frontend"
+}
 Start-Sleep -Milliseconds 500
 
 $BackendPort = Find-FreePort $BackendPort
@@ -398,12 +513,12 @@ if (-not (Test-Path $venvPython)) {
     throw "Backend virtual environment was not found. Install Windows Python 3.11+ and run .\setup.ps1 -Dev first."
 }
 
-$npm = Get-CommandPath "npm.cmd"
-if (-not $npm) {
-    $npm = Get-CommandPath "npm"
+$node = Get-CommandPath "node.exe"
+if (-not $node) {
+    $node = Get-CommandPath "node"
 }
-if (-not $npm) {
-    throw "npm was not found. Install Node.js 18+ and run .\setup.ps1 -Dev first."
+if (-not $node) {
+    throw "node was not found. Install Node.js 18+ and run .\setup.ps1 -Dev first."
 }
 if (-not (Test-Path (Join-Path $FrontendDir "node_modules"))) {
     throw "frontend\node_modules was not found. Run .\setup.ps1 -Dev first."
@@ -411,6 +526,10 @@ if (-not (Test-Path (Join-Path $FrontendDir "node_modules"))) {
 $viteCmd = Join-Path $FrontendDir "node_modules\.bin\vite.cmd"
 if (-not (Test-Path $viteCmd)) {
     throw "frontend\node_modules is missing Windows command shims such as vite.cmd. Run .\setup.ps1 -Dev to recreate frontend dependencies for PowerShell."
+}
+$viteJs = Join-Path $FrontendDir "node_modules\vite\bin\vite.js"
+if (-not (Test-Path $viteJs)) {
+    throw "frontend\node_modules is missing Vite's JS entrypoint. Run .\setup.ps1 -Dev to recreate frontend dependencies for PowerShell."
 }
 
 Write-Step "Running database maintenance"
@@ -434,8 +553,8 @@ $env:CI = "true"
 $env:BACKEND_PORT = "$BackendPort"
 Start-ManagedProcess `
     -Name "frontend" `
-    -FilePath $npm `
-    -Arguments @("run", "dev", "--", "--host", "0.0.0.0", "--port", "$FrontendPort", "--strictPort") `
+    -FilePath $node `
+    -Arguments @($viteJs, "--host", "0.0.0.0", "--port", "$FrontendPort", "--strictPort") `
     -WorkingDirectory $FrontendDir `
     -StdoutLog $FrontendLog `
     -StderrLog $FrontendErrLog `
@@ -444,11 +563,10 @@ Start-ManagedProcess `
 Wait-ForHttp "Frontend" "http://localhost:$FrontendPort" 20 | Out-Null
 
 Write-Step "Verifying API proxy"
-try {
-    Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$FrontendPort/api/health" -TimeoutSec 3 > $null
+if (Test-HttpOk "http://localhost:$FrontendPort/api/health" 3) {
     Write-Ok "Proxy working"
 }
-catch {
+else {
     Write-Warn "Proxy may need a moment. Backend direct URL: http://localhost:$BackendPort/api/health"
 }
 
