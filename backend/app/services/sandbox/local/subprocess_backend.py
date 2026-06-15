@@ -144,7 +144,7 @@ class SubprocessBackend(BaseSandboxBackend):
     def _build_command(self, language: str, script_path: str, work_path: Path, *, use_venv: bool = True) -> list[str]:
         if language == "python":
             python_cmd = self._sandbox_venv_python() if use_venv else "python3"
-            return [python_cmd, "-I", "-B", str(script_path)]
+            return [python_cmd, "-X", "utf8", "-I", "-B", str(script_path)]
         if language == "bash":
             return ["bash", "--noprofile", "--norc", str(script_path)]
         return ["node", str(script_path)]
@@ -160,7 +160,7 @@ class SubprocessBackend(BaseSandboxBackend):
     ) -> list[str]:
         if language == "python":
             python_cmd = self._host_venv_python(work_path) if use_venv else self._host_python_command()
-            return [python_cmd, "-I", "-B", str(script_path)]
+            return [python_cmd, "-X", "utf8", "-I", "-B", str(script_path)]
         if language == "bash":
             if os.name == "nt" and code is not None:
                 return ["bash", "--noprofile", "--norc", "-c", code]
@@ -180,6 +180,10 @@ class SubprocessBackend(BaseSandboxBackend):
                 "PATH": os.pathsep.join(part for part in (str(venv_bin), current_path) if part),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONNOUSERSITE": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
                 "TMPDIR": str(workspace_tmp),
                 "NODE_PATH": "",
                 "BASH_ENV": "",
@@ -599,7 +603,7 @@ class SubprocessBackend(BaseSandboxBackend):
                     # Real-time streaming: push each chunk to the WebSocket
                     if on_output:
                         try:
-                            text = chunk.decode("utf-8", errors="replace")
+                            text = self._decode_output(chunk, max(1, len(chunk) * 2))
                             await on_output(text, label)
                         except Exception:
                             pass

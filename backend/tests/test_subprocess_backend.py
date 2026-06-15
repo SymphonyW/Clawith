@@ -121,6 +121,33 @@ async def test_host_fallback_rewrites_workspace_alias(monkeypatch, tmp_path):
     assert tmp_path.as_posix() in recorded["script"]
 
 
+@pytest.mark.asyncio
+async def test_live_stream_decodes_gbk_output(monkeypatch, tmp_path):
+    backend = SubprocessBackend(_local_fallback_config())
+    streamed: list[tuple[str, str]] = []
+
+    async def fake_create_subprocess_exec(*_cmd, **_kwargs):
+        return _FakeProcess(stdout="步骤完成\n".encode("gbk"))
+
+    async def on_output(text: str, label: str):
+        streamed.append((label, text))
+
+    monkeypatch.setattr(backend, "_ensure_workspace_venv", lambda _work_path: (False, "ensurepip unavailable"))
+    monkeypatch.setattr(backend, "_build_bwrap_command", lambda _command, _work_path, **_kwargs: None)
+    monkeypatch.setattr(subprocess_backend.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await backend.execute(
+        code="print('unused')",
+        language="python",
+        work_dir=str(tmp_path),
+        on_output=on_output,
+    )
+
+    assert result.success is True
+    assert result.stdout == "步骤完成\n"
+    assert streamed == [("stdout", "步骤完成\n")]
+
+
 def test_git_network_commands_require_network_access():
     assert _check_code_safety("bash", "git clone https://github.com/example/repo.git", False)
     assert _check_code_safety("bash", "git clone https://github.com/example/repo.git", True) is None

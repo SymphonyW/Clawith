@@ -15,6 +15,7 @@ import asyncio
 from dataclasses import dataclass
 import fnmatch
 import json
+import locale
 import multiprocessing as mp
 import os
 import queue
@@ -7955,6 +7956,39 @@ _DANGEROUS_NODE_NETWORK = [
 ]
 
 
+def _decode_execution_output(data: bytes, limit: int) -> str:
+    if not data:
+        return ""
+
+    encodings: list[str] = []
+    if os.name == "nt" and data[:80].count(b"\x00") > 8:
+        encodings.append("utf-16-le")
+    encodings.append("utf-8")
+
+    preferred = locale.getpreferredencoding(False)
+    if preferred and preferred.lower() not in {encoding.lower() for encoding in encodings}:
+        encodings.append(preferred)
+    if os.name == "nt":
+        for encoding in ("gbk", "cp936"):
+            if encoding not in {item.lower() for item in encodings}:
+                encodings.append(encoding)
+
+    best = ""
+    best_replacements = 10**9
+    for encoding in encodings:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            text = data.decode(encoding, errors="replace")
+        replacements = text.count("\ufffd")
+        if replacements < best_replacements:
+            best = text
+            best_replacements = replacements
+        if replacements == 0:
+            break
+    return best[:limit]
+
+
 def _python_git_network_command_detected(code: str) -> bool:
     return bool(
         re.search(
@@ -8136,7 +8170,7 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
     # Determine command and file extension
     if language == "python":
         ext = ".py"
-        cmd_prefix = [sys.executable or shutil.which("python3") or shutil.which("python") or "python3"]
+        cmd_prefix = [sys.executable or shutil.which("python3") or shutil.which("python") or "python3", "-X", "utf8"]
     elif language == "bash":
         ext = ".sh"
         cmd_prefix = ["bash"]
@@ -8155,6 +8189,10 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
         safe_env = dict(os.environ)
         safe_env["HOME"] = str(work_dir)
         safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        safe_env["PYTHONIOENCODING"] = "utf-8"
+        safe_env["PYTHONUTF8"] = "1"
+        safe_env["LANG"] = "C.UTF-8"
+        safe_env["LC_ALL"] = "C.UTF-8"
         safe_env["CLAWITH_AGENT_ROOT"] = str(work_dir)
         safe_env["CLAWITH_WORKSPACE_DIR"] = str(work_dir / "workspace")
         safe_env["WORKSPACE_DIR"] = str(work_dir / "workspace")
@@ -8182,7 +8220,7 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
                 # Real-time streaming: push each chunk to the WebSocket
                 if on_output:
                     try:
-                        text = chunk.decode("utf-8", errors="replace")
+                        text = _decode_execution_output(chunk, max(1, len(chunk) * 2))
                         await on_output(text, label)
                     except Exception:
                         pass
@@ -8201,8 +8239,8 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
         stdout = bytes(stdout_data)
         stderr = bytes(stderr_data)
 
-        stdout_str = stdout.decode("utf-8", errors="replace")[:10000] if stdout else ""
-        stderr_str = stderr.decode("utf-8", errors="replace")[:5000] if stderr else ""
+        stdout_str = _decode_execution_output(stdout, 10000)
+        stderr_str = _decode_execution_output(stderr, 5000)
 
         result_parts = []
         if stdout_str.strip():
