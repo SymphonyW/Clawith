@@ -96,9 +96,18 @@ bash setup.sh         # Production: installs runtime dependencies only (~1 min)
 bash setup.sh --dev   # Development: also installs pytest and test tools (~3 min)
 ```
 
+Windows PowerShell without WSL:
+
+```powershell
+git clone https://github.com/dataelement/Clawith.git
+cd Clawith
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1 -Dev
+```
+
 This will:
 1. Create `.env` from `.env.example`
-2. Set up PostgreSQL — uses an existing instance if available, or **automatically downloads and starts a local one**
+2. Set up PostgreSQL and Redis — Bash uses a local instance when available; Windows PowerShell starts Docker Desktop containers
 3. Install backend dependencies (Python venv + pip)
 4. Install frontend dependencies (npm)
 5. Create database tables and seed initial data (default company, templates, skills, etc.)
@@ -114,6 +123,20 @@ Then start the app:
 bash restart.sh
 # → Frontend: http://localhost:3008
 # → Backend:  http://localhost:8008
+```
+
+On Windows PowerShell:
+
+```powershell
+.\restart.ps1
+```
+
+Stop the Windows PowerShell services:
+
+```powershell
+.\stop.ps1
+# Add -Containers to also stop local PostgreSQL and Redis
+# Add -Wsl to stop old Ubuntu/WSL services that still hold 3008 or 8008
 ```
 
 ### Docker

@@ -10,6 +10,12 @@ Thanks for your interest in contributing! Whether it's a bug fix, new feature, t
    bash setup.sh    # Backend + frontend + database
    bash restart.sh  # Start services → http://localhost:3008
    ```
+   Windows PowerShell without WSL:
+   ```powershell
+   .\setup.ps1 -Dev
+   .\restart.ps1
+   .\stop.ps1
+   ```
 3. Create a branch: `git checkout -b my-feature`
 4. Make your changes
 5. Push and open a Pull Request
@@ -167,43 +173,76 @@ Para garantizar que todos los contribuidores puedan participar de manera efectiv
 
 ## Windows Development
 
-Clawith is primarily developed on Linux/macOS, but can run on Windows with a few adjustments.
+Clawith can run on Windows without WSL. Use the PowerShell scripts from the repository root; do not run `bash setup.sh` from PowerShell, because Windows resolves `bash` to the WSL launcher on many machines.
 
 ### Prerequisites
 
-- **Python 3.11+** — Install from [python.org](https://www.python.org/downloads/) (check "Add to PATH")
-- **Node.js 18+** — Install from [nodejs.org](https://nodejs.org/)
-- **Docker Desktop** — For PostgreSQL and Redis (recommended over native installs)
+- **Python 3.11+** - Install from [python.org](https://www.python.org/downloads/) and check "Add to PATH"
+- **Node.js 18+** - Install from [nodejs.org](https://nodejs.org/)
+- **Docker Desktop** - Used for PostgreSQL and Redis in local Windows development
 
-### Database & Redis via Docker
+### PowerShell Setup
 
 ```powershell
-docker run -d --name clawith-postgres -p 5432:5432 -e POSTGRES_PASSWORD=yourpass -e POSTGRES_DB=clawith postgres:15
-docker run -d --name clawith-redis -p 6379:6379 redis:7
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1 -Dev
 ```
 
-### Backend Setup
+The setup script creates `.env`, starts local Docker containers named `clawith-postgres` and `clawith-redis`, creates `backend\.venv`, installs backend dependencies from `pyproject.toml`, installs frontend packages, runs migrations, and seeds initial data.
+
+For runtime dependencies only, omit `-Dev`:
 
 ```powershell
+.\setup.ps1
+```
+
+### Start Services
+
+```powershell
+.\restart.ps1
+```
+
+By default this starts the backend on `http://localhost:8008` and the frontend on `http://localhost:3008`. If a port is already busy, `restart.ps1` picks the next available port and prints the final URLs.
+
+### Stop Services
+
+```powershell
+.\stop.ps1
+```
+
+This stops the backend and frontend started by `restart.ps1`. To also stop the local PostgreSQL and Redis containers, run:
+
+```powershell
+.\stop.ps1 -Containers
+```
+
+If old WSL-launched services are still holding ports such as `3008` or `8008`, terminate the Ubuntu distro that started them:
+
+```powershell
+.\stop.ps1 -Wsl
+```
+
+### Manual Equivalent
+
+If you need to run each piece manually:
+
+```powershell
+docker run -d --name clawith-postgres -p 5432:5432 -e POSTGRES_USER=clawith -e POSTGRES_PASSWORD=clawith -e POSTGRES_DB=clawith postgres:15
+docker run -d --name clawith-redis -p 6379:6379 redis:7
+
 cd backend
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:DATABASE_URL="postgresql+asyncpg://clawith:clawith@localhost:5432/clawith?ssl=disable"
+$env:REDIS_URL="redis://localhost:6379/0"
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe seed.py
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8008
 
-# Create .env (copy from .env.example and adjust DATABASE_URL / REDIS_URL)
-# Run database migrations
-alembic upgrade head
-
-# Start the server
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-### Frontend Setup
-
-```powershell
-cd frontend
+cd ..\frontend
 npm install
-npm run dev
+$env:BACKEND_PORT="8008"
+npm run dev -- --host 0.0.0.0 --port 3008
 ```
 
 ### Common Windows Issues
@@ -213,7 +252,8 @@ npm run dev
 | `UnicodeEncodeError` / GBK encoding | Set `PYTHONUTF8=1` in environment variables, or run `chcp 65001` before starting |
 | System proxy intercepting LLM API calls | Set `NO_PROXY=*` or unset `HTTP_PROXY` / `HTTPS_PROXY` in your terminal |
 | `uvicorn --reload` crashes with watchfiles | Remove `--reload` flag, or install `watchfiles`: `pip install watchfiles` |
-| File path errors with backslashes | Use `pathlib.Path` — the codebase already does this in most places |
+| `bash setup.sh` opens Ubuntu/asks for a Linux password | Use `.\setup.ps1 -Dev` from PowerShell instead |
+| File path errors with backslashes | Use `pathlib.Path`; the codebase already does this in most places |
 
 > **Note**: The recommended deployment method is Docker (`docker compose up -d`), which works identically on Windows, macOS, and Linux. The instructions above are for local development without Docker.
 

@@ -88,7 +88,16 @@ bash setup.sh         # 生产/测试：只装运行依赖（约 1 分钟）
 bash setup.sh --dev   # 开发环境：额外装 pytest 等测试工具（约 3 分钟）
 ```
 
-自动完成：创建 `.env` → 设置 PostgreSQL（优先使用已有实例，找不到则**自动下载并启动本地实例**）→ 安装后端/前端依赖 → 建表 → 初始化默认公司、模板和技能。
+Windows PowerShell（不经过 WSL）：
+
+```powershell
+git clone https://github.com/dataelement/Clawith.git
+cd Clawith
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1 -Dev
+```
+
+自动完成：创建 `.env` → 设置 PostgreSQL 和 Redis（Bash 优先使用已有本地实例；Windows PowerShell 使用 Docker Desktop 容器）→ 安装后端/前端依赖 → 建表 → 初始化默认公司、模板和技能。
 
 > **注意：** 如需指定特定的 PostgreSQL 实例，请先创建 `.env` 文件并设置 `DATABASE_URL`：
 > ```
@@ -101,6 +110,20 @@ bash setup.sh --dev   # 开发环境：额外装 pytest 等测试工具（约 3 
 bash restart.sh
 # → 前端: http://localhost:3008
 # → 后端: http://localhost:8008
+```
+
+Windows PowerShell：
+
+```powershell
+.\restart.ps1
+```
+
+关闭 Windows PowerShell 启动的服务：
+
+```powershell
+.\stop.ps1
+# 如需同时停止本地 PostgreSQL 和 Redis 容器，加 -Containers
+# 如需停止旧 Ubuntu/WSL 残留服务占用的 3008 或 8008，加 -Wsl
 ```
 
 ### Docker 部署
