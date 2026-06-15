@@ -912,7 +912,7 @@ BUILTIN_TOOLS = [
     {
         "name": "execute_code",
         "display_name": "Code Executor",
-        "description": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess within the agent's workspace. Useful for data processing, calculations, file transformations, and automation.",
+        "description": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess within the agent root. Use relative paths like workspace/repo; set workdir='workspace' to run inside the workspace folder.",
         "category": "code",
         "icon": "💻",
         "is_default": True,
@@ -920,7 +920,11 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
-                "code": {"type": "string", "description": "Code to execute"},
+                "code": {"type": "string", "description": "Code to execute. Use relative paths; do not hardcode /workspace."},
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional relative working directory under the agent root, e.g. workspace or workspace/my-project.",
+                },
                 "timeout": {"type": "integer", "description": "Max execution time in seconds (default 30, max 60)"},
             },
             "required": ["language", "code"],

@@ -18,6 +18,8 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import shutil
+import sys
 import tempfile
 import uuid
 import unicodedata
@@ -63,6 +65,7 @@ from app.services.workspace_collaboration import (
 from app.services.storage import get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import WriteCondition, content_hash_bytes
 from app.services.workspace_locking import workspace_locks
+from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
 from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
@@ -818,7 +821,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_code",
-            "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory, so you can access skills/, workspace/, memory/ etc. directly. Security restrictions apply: no system-level operations, 30-second default timeout.",
+            "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory by default, so use relative paths like workspace/repo, skills/, and memory/. To run commands inside the workspace folder, set workdir='workspace' instead of hardcoding /workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -829,7 +832,11 @@ AGENT_TOOLS = [
                     },
                     "code": {
                         "type": "string",
-                        "description": "Code to execute. If a Python import fails due to a missing package, install it first via execute_code with language='bash' and code='pip install <package>'. Working directory is the agent root (skills/, workspace/, memory/ are accessible).",
+                        "description": "Code to execute. If a Python import fails due to a missing package, install it first via execute_code with language='bash' and code='pip install <package>'. Use relative paths from the agent root; do not hardcode /workspace.",
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional relative working directory under the agent root, e.g. 'workspace' or 'workspace/my-project'. Never use an absolute path.",
                     },
                     "timeout": {
                         "type": "integer",
@@ -7925,6 +7932,7 @@ _DANGEROUS_BASH_ALWAYS = [
 
 _DANGEROUS_BASH_NETWORK = [
     "curl ", "wget ", "nc ", "ncat ", "ssh ", "scp ",
+    "git clone", "git fetch", "git pull", "git ls-remote", "git submodule update",
 ]
 
 _DANGEROUS_PYTHON_IMPORTS_ALWAYS = [
@@ -7935,6 +7943,7 @@ _DANGEROUS_PYTHON_IMPORTS_ALWAYS = [
 _DANGEROUS_PYTHON_IMPORTS_NETWORK = [
     "socket", "http.client", "urllib.request", "requests",
     "ftplib", "smtplib", "telnetlib", "ctypes",
+    "git clone", "git fetch", "git pull", "git ls-remote",
 ]
 
 _DANGEROUS_NODE_ALWAYS = [
@@ -7944,6 +7953,17 @@ _DANGEROUS_NODE_ALWAYS = [
 _DANGEROUS_NODE_NETWORK = [
     "require('http')", "require('https')", "require('net')",
 ]
+
+
+def _python_git_network_command_detected(code: str) -> bool:
+    return bool(
+        re.search(
+            r"subprocess\.(?:run|call|popen|check_call|check_output)\s*\([^)]*"
+            r"['\"]git['\"]\s*,\s*['\"](?:clone|fetch|pull|ls-remote)['\"]",
+            code,
+            re.DOTALL,
+        )
+    )
 
 
 def _check_code_safety(language: str, code: str, allow_network: bool = False) -> str | None:
@@ -7969,6 +7989,9 @@ def _check_code_safety(language: str, code: str, allow_network: bool = False) ->
             for pattern in _DANGEROUS_PYTHON_IMPORTS_NETWORK:
                 if pattern.lower() in code_lower:
                     return f"❌ Blocked: network operation not allowed ({pattern})"
+
+            if _python_git_network_command_detected(code_lower):
+                return "Blocked: network operation not allowed (git)"
 
     elif language == "node":
         for pattern in _DANGEROUS_NODE_ALWAYS:
@@ -8003,6 +8026,7 @@ async def _execute_code(
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
     requested_timeout = arguments.get("timeout", 30)
+    requested_workdir = str(arguments.get("workdir") or arguments.get("work_dir") or "").strip().replace("\\", "/")
 
     if not code.strip():
         return "❌ No code provided"
@@ -8014,6 +8038,11 @@ async def _execute_code(
     # This allows code to access skills/, workspace/, memory/ etc. directly.
     work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    if requested_workdir:
+        try:
+            resolve_path_within_root(work_dir, requested_workdir, label="workdir")
+        except WorkspacePathError as exc:
+            return f"Error: {exc}"
 
     # For E2B tool: do NOT fall back to local subprocess on error —
     # the user explicitly chose cloud execution.
@@ -8046,6 +8075,7 @@ async def _execute_code(
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
+            execution_workdir=requested_workdir,
             on_output=on_output,
         )
 
@@ -8096,11 +8126,17 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
     # This allows code to access skills/, workspace/, memory/ etc. directly
     work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    requested_workdir = str(arguments.get("workdir") or arguments.get("work_dir") or "").strip().replace("\\", "/")
+    try:
+        execution_cwd = resolve_path_within_root(work_dir, requested_workdir, label="workdir")
+    except WorkspacePathError as exc:
+        return f"Error: {exc}"
+    execution_cwd.mkdir(parents=True, exist_ok=True)
 
     # Determine command and file extension
     if language == "python":
         ext = ".py"
-        cmd_prefix = ["python3"]
+        cmd_prefix = [sys.executable or shutil.which("python3") or shutil.which("python") or "python3"]
     elif language == "bash":
         ext = ".sh"
         cmd_prefix = ["bash"]
@@ -8113,16 +8149,19 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
     # Write code to a temp file inside workspace
     script_path = work_dir / f"_exec_tmp{ext}"
     try:
-        script_path.write_text(code, encoding="utf-8")
+        script_path.write_text(code.replace("/workspace", work_dir.as_posix()), encoding="utf-8")
 
         # Inherit parent environment but override HOME to workspace
         safe_env = dict(os.environ)
         safe_env["HOME"] = str(work_dir)
         safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        safe_env["CLAWITH_AGENT_ROOT"] = str(work_dir)
+        safe_env["CLAWITH_WORKSPACE_DIR"] = str(work_dir / "workspace")
+        safe_env["WORKSPACE_DIR"] = str(work_dir / "workspace")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd_prefix, str(script_path),
-            cwd=str(work_dir),
+            cwd=str(execution_cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_env,
