@@ -912,15 +912,15 @@ BUILTIN_TOOLS = [
     {
         "name": "execute_code",
         "display_name": "Code Executor",
-        "description": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess within the agent root. Use relative paths like workspace/repo; set workdir='workspace' to run inside the workspace folder.",
+        "description": "Execute code (Python, shell commands, Node.js) in a local sandboxed subprocess within the agent root. On Windows, language='bash' runs through PowerShell, not WSL. Use relative paths like workspace/repo; set workdir='workspace' to run inside the workspace folder.",
         "category": "code",
         "icon": "💻",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
-                "code": {"type": "string", "description": "Code to execute. Use relative paths; do not hardcode /workspace."},
+                "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language. Use language='bash' for shell commands; on Windows this is PowerShell, not WSL."},
+                "code": {"type": "string", "description": "Code to execute. On Windows shell commands run in PowerShell, not WSL. Use relative paths; do not hardcode /workspace."},
                 "workdir": {
                     "type": "string",
                     "description": "Optional relative working directory under the agent root, e.g. workspace or workspace/my-project.",
