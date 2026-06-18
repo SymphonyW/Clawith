@@ -822,18 +822,18 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_code",
-            "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory by default, so use relative paths like workspace/repo, skills/, and memory/. To run commands inside the workspace folder, set workdir='workspace' instead of hardcoding /workspace.",
+            "description": "Execute code (Python, shell commands, or Node.js) in a local sandboxed subprocess within the agent's root directory. On Windows, language='bash' runs through PowerShell, not WSL. Code runs with the agent root as the working directory by default, so use relative paths like workspace/repo, skills/, and memory/. To run commands inside the workspace folder, set workdir='workspace' instead of hardcoding /workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "language": {
                         "type": "string",
                         "enum": ["python", "bash", "node"],
-                        "description": "Programming language to execute",
+                        "description": "Programming language to execute. Use language='bash' for shell commands; on Windows this is PowerShell, not WSL.",
                     },
                     "code": {
                         "type": "string",
-                        "description": "Code to execute. If a Python import fails due to a missing package, install it first via execute_code with language='bash' and code='pip install <package>'. Use relative paths from the agent root; do not hardcode /workspace.",
+                        "description": "Code to execute. If a Python import fails due to a missing package, install it first via execute_code with language='bash' and code='pip install <package>'. On Windows shell commands run in PowerShell, not WSL. Use relative paths from the agent root; do not hardcode /workspace.",
                     },
                     "workdir": {
                         "type": "string",
@@ -7989,6 +7989,137 @@ def _decode_execution_output(data: bytes, limit: int) -> str:
     return best[:limit]
 
 
+def _host_powershell_command() -> str:
+    if os.name != "nt":
+        return shutil.which("pwsh") or shutil.which("powershell") or "pwsh"
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    windows_powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if windows_powershell.exists():
+        return str(windows_powershell)
+    return shutil.which("powershell.exe") or shutil.which("powershell") or "powershell.exe"
+
+
+def _windows_shell_prelude() -> str:
+    return r"""
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+Remove-Item Alias:ls -Force -ErrorAction SilentlyContinue
+Remove-Item Alias:pwd -Force -ErrorAction SilentlyContinue
+
+function global:pwd {
+    (Get-Location).Path
+}
+
+function global:ls {
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Items)
+    $paths = @()
+    foreach ($item in $Items) {
+        if ($item -and -not $item.StartsWith('-')) {
+            $paths += $item
+        }
+    }
+    if ($paths.Count -eq 0) {
+        Get-ChildItem -Force
+    }
+    else {
+        foreach ($path in $paths) {
+            Get-ChildItem -Force -LiteralPath $path
+        }
+    }
+}
+""".lstrip()
+
+
+def _prepare_windows_shell_script(code: str) -> str:
+    lines: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#!") or stripped in {
+            "set -e",
+            "set -eu",
+            "set -euo pipefail",
+            "set -o pipefail",
+        }:
+            continue
+        export_match = re.match(r"^export\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", stripped)
+        if export_match:
+            key, raw_value = export_match.groups()
+            value = raw_value.strip().strip('"').strip("'").replace("'", "''")
+            lines.append(f"$env:{key} = '{value}'")
+            continue
+        lines.append(line)
+    return _windows_shell_prelude() + "\n".join(lines) + "\n"
+
+
+def _ensure_windows_command_shims(work_dir: Path) -> Path | None:
+    if os.name != "nt":
+        return None
+
+    shim_dir = work_dir / ".tmp" / "win-shims"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    powershell = _host_powershell_command()
+    escaped_powershell = powershell.replace('"', '""')
+    bash_cmd = f"""@echo off
+setlocal
+set "CLAWITH_PS={escaped_powershell}"
+"%CLAWITH_PS%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0bash-shim.ps1" %*
+exit /b %ERRORLEVEL%
+"""
+    bash_ps1 = _windows_shell_prelude() + r"""
+$mode = 'file'
+$remaining = New-Object System.Collections.Generic.List[string]
+foreach ($arg in $args) {
+    if ($arg -eq '--noprofile' -or $arg -eq '--norc' -or $arg -eq '-l') {
+        continue
+    }
+    if ($arg -eq '-c' -or $arg -eq '-lc') {
+        $mode = 'command'
+        continue
+    }
+    $remaining.Add($arg)
+}
+
+if ($mode -eq 'command') {
+    if ($remaining.Count -eq 0) {
+        Write-Error "No command was provided to the Windows shell shim."
+        exit 127
+    }
+    $command = $remaining[0] -replace '\s+&&\s+', '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; '
+    Invoke-Expression $command
+    if ($LASTEXITCODE -is [int]) {
+        exit $LASTEXITCODE
+    }
+    exit 0
+}
+
+if ($remaining.Count -eq 0) {
+    Write-Error "Bash/WSL is disabled in Clawith's Windows execute_code environment. Use PowerShell or Windows commands instead."
+    exit 127
+}
+
+. $remaining[0]
+if ($LASTEXITCODE -is [int]) {
+    exit $LASTEXITCODE
+}
+"""
+    wsl_shim = """@echo off
+echo WSL is disabled in Clawith's Windows execute_code environment. Use PowerShell or Windows commands instead. 1>&2
+exit /b 127
+"""
+    for name, content in {
+        "bash.cmd": bash_cmd,
+        "sh.cmd": bash_cmd,
+        "bash-shim.ps1": bash_ps1,
+        "wsl.cmd": wsl_shim,
+    }.items():
+        target = shim_dir / name
+        if not target.exists() or target.read_text(encoding="utf-8") != content:
+            target.write_text(content, encoding="utf-8")
+    return shim_dir
+
+
 def _python_git_network_command_detected(code: str) -> bool:
     return bool(
         re.search(
@@ -8000,11 +8131,29 @@ def _python_git_network_command_detected(code: str) -> bool:
     )
 
 
+def _windows_shell_command_detected(code: str) -> bool:
+    return bool(
+        re.search(
+            r"(^|[;&|]\s*)(?:bash|bash\.exe|sh|sh\.exe|wsl|wsl\.exe)\b",
+            code,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def _python_windows_shell_command_detected(code: str) -> bool:
+    if not re.search(r"\b(?:subprocess|os\.system|os\.popen)\b", code):
+        return False
+    return bool(re.search(r"['\"](?:bash|bash\.exe|sh|sh\.exe|wsl|wsl\.exe)['\"]", code, re.IGNORECASE))
+
+
 def _check_code_safety(language: str, code: str, allow_network: bool = False) -> str | None:
     """Check code for dangerous patterns. Returns error message if unsafe, None if ok."""
     code_lower = code.lower()
 
     if language == "bash":
+        if os.name == "nt" and _windows_shell_command_detected(code):
+            return "Blocked: WSL/Bash is disabled on Windows. Use PowerShell or Windows commands instead."
         for pattern in _DANGEROUS_BASH_ALWAYS:
             if pattern.lower() in code_lower:
                 return f"❌ Blocked: dangerous command detected ({pattern.strip()})"
@@ -8016,6 +8165,8 @@ def _check_code_safety(language: str, code: str, allow_network: bool = False) ->
             return "❌ Blocked: directory traversal not allowed"
 
     elif language == "python":
+        if os.name == "nt" and _python_windows_shell_command_detected(code):
+            return "Blocked: WSL/Bash is disabled on Windows. Use PowerShell or Windows commands instead."
         for pattern in _DANGEROUS_PYTHON_IMPORTS_ALWAYS:
             if pattern.lower() in code_lower:
                 return f"❌ Blocked: unsafe operation detected ({pattern})"
@@ -8172,8 +8323,20 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
         ext = ".py"
         cmd_prefix = [sys.executable or shutil.which("python3") or shutil.which("python") or "python3", "-X", "utf8"]
     elif language == "bash":
-        ext = ".sh"
-        cmd_prefix = ["bash"]
+        if os.name == "nt":
+            ext = ".ps1"
+            cmd_prefix = [
+                _host_powershell_command(),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ]
+        else:
+            ext = ".sh"
+            cmd_prefix = ["bash"]
     elif language == "node":
         ext = ".js"
         cmd_prefix = ["node"]
@@ -8183,10 +8346,16 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
     # Write code to a temp file inside workspace
     script_path = work_dir / f"_exec_tmp{ext}"
     try:
-        script_path.write_text(code.replace("/workspace", work_dir.as_posix()), encoding="utf-8")
+        script_code = code.replace("/workspace", work_dir.as_posix())
+        if language == "bash" and os.name == "nt":
+            script_code = _prepare_windows_shell_script(script_code)
+        script_path.write_text(script_code, encoding="utf-8")
 
         # Inherit parent environment but override HOME to workspace
         safe_env = dict(os.environ)
+        windows_shim_dir = _ensure_windows_command_shims(work_dir)
+        if windows_shim_dir:
+            safe_env["PATH"] = os.pathsep.join([str(windows_shim_dir), safe_env.get("PATH", "")])
         safe_env["HOME"] = str(work_dir)
         safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
         safe_env["PYTHONIOENCODING"] = "utf-8"

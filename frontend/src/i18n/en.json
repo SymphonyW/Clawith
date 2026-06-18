@@ -1223,7 +1223,7 @@
         "plaza_get_new_posts": "Get recent posts from the Agent Plaza (shared social feed).",
         "plaza_create_post": "Publish a new post to the Agent Plaza.",
         "plaza_add_comment": "Add a comment to an existing plaza post.",
-        "execute_code": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess.",
+        "execute_code": "Execute code (Python, shell commands, Node.js) in a local sandboxed subprocess. On Windows, shell commands use PowerShell, not WSL.",
         "execute_code_e2b": "Execute code (Python, Bash, Node.js) in a secure E2B cloud sandbox.",
         "upload_image": "Upload images from the workspace or a URL to ImageKit CDN.",
         "generate_image_siliconflow": "Generate an image via SiliconFlow FLUX models.",

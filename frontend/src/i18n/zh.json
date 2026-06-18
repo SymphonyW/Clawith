@@ -1346,7 +1346,7 @@
         "plaza_get_new_posts": "从数字员工广场（共享社交动态）获取最新帖子。",
         "plaza_create_post": "向数字员工广场发布新帖子。",
         "plaza_add_comment": "为现有广场帖子添加评论。",
-        "execute_code": "在本地沙箱子进程中执行代码（Python、Bash、Node.js）。",
+        "execute_code": "在本地沙箱子进程中执行代码（Python、Shell、Node.js；Windows 下 Shell 使用 PowerShell，不使用 WSL）。",
         "execute_code_e2b": "在安全的 E2B 云沙箱中执行代码（Python、Bash、Node.js）。",
         "upload_image": "将工作区或 URL 的图片上传到 ImageKit CDN。",
         "generate_image_siliconflow": "通过 SiliconFlow FLUX 模型生成图片。",

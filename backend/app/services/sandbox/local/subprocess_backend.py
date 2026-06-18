@@ -62,11 +62,29 @@ def _python_git_network_command_detected(code: str) -> bool:
     )
 
 
+def _windows_shell_command_detected(code: str) -> bool:
+    return bool(
+        re.search(
+            r"(^|[;&|]\s*)(?:bash|bash\.exe|sh|sh\.exe|wsl|wsl\.exe)\b",
+            code,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
+def _python_windows_shell_command_detected(code: str) -> bool:
+    if not re.search(r"\b(?:subprocess|os\.system|os\.popen)\b", code):
+        return False
+    return bool(re.search(r"['\"](?:bash|bash\.exe|sh|sh\.exe|wsl|wsl\.exe)['\"]", code, re.IGNORECASE))
+
+
 def _check_code_safety(language: str, code: str, allow_network: bool = False) -> str | None:
     """Check code for dangerous patterns. Returns error message if unsafe, None if ok."""
     code_lower = code.lower()
 
     if language == "bash":
+        if os.name == "nt" and _windows_shell_command_detected(code):
+            return "Blocked: WSL/Bash is disabled on Windows. Use PowerShell or Windows commands instead."
         # Always check dangerous patterns
         for pattern in _DANGEROUS_BASH_ALWAYS:
             if pattern.lower() in code_lower:
@@ -82,6 +100,8 @@ def _check_code_safety(language: str, code: str, allow_network: bool = False) ->
             return "Blocked: directory traversal not allowed"
 
     elif language == "python":
+        if os.name == "nt" and _python_windows_shell_command_detected(code):
+            return "Blocked: WSL/Bash is disabled on Windows. Use PowerShell or Windows commands instead."
         # Always check dangerous patterns
         for pattern in _DANGEROUS_PYTHON_IMPORTS_ALWAYS:
             if pattern.lower() in code_lower:
@@ -141,6 +161,133 @@ class SubprocessBackend(BaseSandboxBackend):
             return sys.executable
         return shutil.which("python3") or shutil.which("python") or "python3"
 
+    def _host_powershell_command(self) -> str:
+        if os.name != "nt":
+            return shutil.which("pwsh") or shutil.which("powershell") or "pwsh"
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        windows_powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if windows_powershell.exists():
+            return str(windows_powershell)
+        return shutil.which("powershell.exe") or shutil.which("powershell") or "powershell.exe"
+
+    def _windows_shell_prelude(self) -> str:
+        return r"""
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+Remove-Item Alias:ls -Force -ErrorAction SilentlyContinue
+Remove-Item Alias:pwd -Force -ErrorAction SilentlyContinue
+
+function global:pwd {
+    (Get-Location).Path
+}
+
+function global:ls {
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Items)
+    $paths = @()
+    foreach ($item in $Items) {
+        if ($item -and -not $item.StartsWith('-')) {
+            $paths += $item
+        }
+    }
+    if ($paths.Count -eq 0) {
+        Get-ChildItem -Force
+    }
+    else {
+        foreach ($path in $paths) {
+            Get-ChildItem -Force -LiteralPath $path
+        }
+    }
+}
+""".lstrip()
+
+    def _prepare_windows_shell_script(self, code: str) -> str:
+        lines: list[str] = []
+        for line in code.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#!") or stripped in {
+                "set -e",
+                "set -eu",
+                "set -euo pipefail",
+                "set -o pipefail",
+            }:
+                continue
+            export_match = re.match(r"^export\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", stripped)
+            if export_match:
+                key, raw_value = export_match.groups()
+                value = raw_value.strip().strip('"').strip("'").replace("'", "''")
+                lines.append(f"$env:{key} = '{value}'")
+                continue
+            lines.append(line)
+        return self._windows_shell_prelude() + "\n".join(lines) + "\n"
+
+    def _ensure_windows_command_shims(self, work_path: Path) -> Path | None:
+        if os.name != "nt":
+            return None
+
+        shim_dir = work_path / ".tmp" / "win-shims"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        powershell = self._host_powershell_command()
+        escaped_powershell = powershell.replace('"', '""')
+        bash_cmd = f"""@echo off
+setlocal
+set "CLAWITH_PS={escaped_powershell}"
+"%CLAWITH_PS%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0bash-shim.ps1" %*
+exit /b %ERRORLEVEL%
+"""
+        bash_ps1 = self._windows_shell_prelude() + r"""
+$mode = 'file'
+$remaining = New-Object System.Collections.Generic.List[string]
+foreach ($arg in $args) {
+    if ($arg -eq '--noprofile' -or $arg -eq '--norc' -or $arg -eq '-l') {
+        continue
+    }
+    if ($arg -eq '-c' -or $arg -eq '-lc') {
+        $mode = 'command'
+        continue
+    }
+    $remaining.Add($arg)
+}
+
+if ($mode -eq 'command') {
+    if ($remaining.Count -eq 0) {
+        Write-Error "No command was provided to the Windows shell shim."
+        exit 127
+    }
+    $command = $remaining[0] -replace '\s+&&\s+', '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; '
+    Invoke-Expression $command
+    if ($LASTEXITCODE -is [int]) {
+        exit $LASTEXITCODE
+    }
+    exit 0
+}
+
+if ($remaining.Count -eq 0) {
+    Write-Error "Bash/WSL is disabled in Clawith's Windows execute_code environment. Use PowerShell or Windows commands instead."
+    exit 127
+}
+
+. $remaining[0]
+if ($LASTEXITCODE -is [int]) {
+    exit $LASTEXITCODE
+}
+"""
+        wsl_shim = """@echo off
+echo WSL is disabled in Clawith's Windows execute_code environment. Use PowerShell or Windows commands instead. 1>&2
+exit /b 127
+"""
+        for name, content in {
+            "bash.cmd": bash_cmd,
+            "sh.cmd": bash_cmd,
+            "bash-shim.ps1": bash_ps1,
+            "wsl.cmd": wsl_shim,
+        }.items():
+            target = shim_dir / name
+            if not target.exists() or target.read_text(encoding="utf-8") != content:
+                target.write_text(content, encoding="utf-8")
+        return shim_dir
+
     def _build_command(self, language: str, script_path: str, work_path: Path, *, use_venv: bool = True) -> list[str]:
         if language == "python":
             python_cmd = self._sandbox_venv_python() if use_venv else "python3"
@@ -162,8 +309,17 @@ class SubprocessBackend(BaseSandboxBackend):
             python_cmd = self._host_venv_python(work_path) if use_venv else self._host_python_command()
             return [python_cmd, "-X", "utf8", "-I", "-B", str(script_path)]
         if language == "bash":
-            if os.name == "nt" and code is not None:
-                return ["bash", "--noprofile", "--norc", "-c", code]
+            if os.name == "nt":
+                return [
+                    self._host_powershell_command(),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script_path),
+                ]
             return ["bash", "--noprofile", "--norc", str(script_path)]
         return ["node", str(script_path)]
 
@@ -173,11 +329,17 @@ class SubprocessBackend(BaseSandboxBackend):
         workspace_dir = work_path / "workspace"
         default_path = "/usr/bin:/bin" if os.name != "nt" else ""
         current_path = os.environ.get("PATH", default_path)
+        windows_shim_dir = self._ensure_windows_command_shims(work_path)
+        path_parts = [str(venv_bin)]
+        if windows_shim_dir:
+            path_parts.append(str(windows_shim_dir))
+        if current_path:
+            path_parts.append(current_path)
         env = dict(os.environ) if os.name == "nt" else {}
         env.update(
             {
                 "HOME": str(work_path),
-                "PATH": os.pathsep.join(part for part in (str(venv_bin), current_path) if part),
+                "PATH": os.pathsep.join(path_parts),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONIOENCODING": "utf-8",
@@ -505,7 +667,7 @@ class SubprocessBackend(BaseSandboxBackend):
         if language == "python":
             ext = ".py"
         elif language == "bash":
-            ext = ".sh"
+            ext = ".ps1" if os.name == "nt" else ".sh"
         elif language == "node":
             ext = ".js"
         
@@ -544,6 +706,8 @@ class SubprocessBackend(BaseSandboxBackend):
             )
             bwrap_command = self._build_bwrap_command(sandbox_command, work_path, sandbox_cwd=sandbox_cwd)
             script_code = code if bwrap_command else self._rewrite_workspace_aliases_for_host(code, work_path)
+            if language == "bash" and os.name == "nt" and not bwrap_command:
+                script_code = self._prepare_windows_shell_script(script_code)
             script_path.write_text(script_code, encoding="utf-8")
             if not bwrap_command:
                 if not self.config.allow_unsafe_fallback_when_bwrap_missing:

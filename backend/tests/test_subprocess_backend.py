@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -66,7 +67,12 @@ async def test_bash_git_clone_does_not_create_python_venv(monkeypatch, tmp_path)
 
     assert result.success is True
     assert result.stdout == "cloned\n"
-    assert recorded["cmd"][0] == "bash"
+    if os.name == "nt":
+        assert Path(recorded["cmd"][0]).name.lower() == "powershell.exe"
+        assert "-File" in recorded["cmd"]
+        assert Path(recorded["cmd"][-1]).suffix == ".ps1"
+    else:
+        assert recorded["cmd"][0] == "bash"
     assert recorded["kwargs"]["cwd"] == str(tmp_path / "workspace")
 
 
@@ -94,6 +100,8 @@ async def test_python_execution_falls_back_when_workspace_venv_cannot_be_created
     assert result.stdout == "ok\n"
     assert "system Python" in result.stderr
     assert recorded["cmd"][0] == (sys.executable or "python3")
+    if os.name == "nt":
+        assert "win-shims" in recorded["kwargs"]["env"]["PATH"]
 
 
 @pytest.mark.asyncio
@@ -156,4 +164,16 @@ def test_git_network_commands_require_network_access():
         "python",
         "subprocess.run(['git', 'clone', 'https://example.com/repo.git'])",
         False,
+    )
+
+
+def test_windows_blocks_explicit_wsl_or_bash_invocation():
+    if os.name != "nt":
+        pytest.skip("Windows-only behavior")
+
+    assert "WSL/Bash is disabled" in _check_code_safety("bash", "bash -lc 'echo hi'", True)
+    assert "WSL/Bash is disabled" in _check_code_safety(
+        "python",
+        "import subprocess\nsubprocess.run(['bash', '-lc', 'echo hi'])",
+        True,
     )
