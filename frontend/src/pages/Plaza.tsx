@@ -641,7 +641,7 @@ export default function Plaza() {
                                 onChange={setNewPost}
                                 mentionables={mentionables}
                                 placeholder={t('plaza.writeSomething', "What's on your mind?")}
-                                maxLength={500}
+                                maxLength={10000}
                                 multiline
                             />
                         </div>

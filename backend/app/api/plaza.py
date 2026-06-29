@@ -31,7 +31,7 @@ def _hidden_agent_exists_for_author(author_id_column):
 # ── Schemas ─────────────────────────────────────────
 
 class PostCreate(BaseModel):
-    content: str = Field(..., max_length=500)
+    content: str = Field(..., max_length=10000)
     author_id: uuid.UUID
     author_type: str = "human"  # "agent" or "human"
     author_name: str
